@@ -48,10 +48,26 @@ class KlayerNN:
         self.d = d
         self.K = K
         self.layers = layers
-        # self.W1 = np.random.normal(loc=0.0, scale=1 / np.sqrt(d), size=(m, d))
-        # self.b1 = np.zeros((m, 1))
-        # self.W2 = np.random.normal(loc=0.0, scale=1e-3, size=(K, m))
-        # self.b2 = np.zeros((K, 1))
+        self.W = []
+        self.b = []
+
+        # Input layer
+        self.W.append(
+            np.random.normal(loc=0.0, scale=1 / np.sqrt(d), size=(layers[0], d))
+        )
+        self.b.append(np.zeros((layers[0], 1)))
+        # k-2 hidden layers
+        for i, m in enumerate(layers[1:-1]):
+            self.W.append(
+                np.random.normal(loc=0.0, scale=1 / np.sqrt(layers[i]), size=(m, layers[i]))
+            )
+            self.b.append(np.zeros((m, 1)))
+
+        # Output layer
+        self.W.append(
+            np.random.normal(loc=0.0, scale=1 / np.sqrt(layers[-2]), size=(K, layers[-2]))
+        )
+        self.b.append(np.zeros((K,1)))
 
     def _saveGDparams(self, GDparams):
         self.lambda_L2 = GDparams['lambda_L2']
@@ -72,11 +88,13 @@ class KlayerNN:
         # plt.show()
 
     def forward_pass(self, X):
-        S1 = self.W1.dot(X) + self.b1
-        H = np.maximum(0, S1)
-        S = self.W2.dot(H) + self.b2
+        S = X
+        for W, b in zip(self.W, self.b):
+            S = W.dot(S) + b
+            S = relu(S)
+
         P = softmax(S)
-        return H, P
+        return S, P
 
     def compute_cost(self, X, y, P=None):
         N = X.shape[1]
@@ -84,7 +102,7 @@ class KlayerNN:
             P = self.forward_pass(X)[1]
 
         loss = -np.log(P[y, np.arange(N)]).mean()
-        reg_term = self.lambda_L2 * (np.square(self.W1).sum() + np.square(self.W2).sum())
+        reg_term = self.lambda_L2 * np.sum([np.square(W).sum() for W in self.W])
 
         return loss + reg_term
 
@@ -127,13 +145,14 @@ class KlayerNN:
 
         return self.history
 
-    def _run_epochs(self, train_data, val_data, N):
+    def _run_epochs(self, train_data, val_data, N, shuffle=True):
         n_batches = N // self.batch_size
 
         for_epoch = trange(self.n_epochs, leave=True, unit='epoch')
 
         for epoch in for_epoch:
-            self.shuffleData(train_data)
+            if shuffle:
+                self.shuffleData(train_data)
 
             # Evaluate for saving in history
             train_loss, train_acc, val_loss, val_acc = self._update_history(train_data, val_data)
@@ -221,8 +240,8 @@ def load_dataset():
     X_test = X_test.reshape(X_test.shape[0], -1).T
     y_train = y_train.reshape(-1)
     y_test = y_test.reshape(-1)
-    Y_train = make_one_hot(y_train)
-    Y_test = make_one_hot(y_test)
+    Y_train = make_one_hot(y_train).T
+    Y_test = make_one_hot(y_test).T
     return (X_train, y_train, Y_train), (X_test, y_test, Y_test)
 
 
@@ -275,10 +294,10 @@ if __name__ == '__main__':
                 'eta_max': 1e-1,
                 'n_s': 800,
                 'n_epochs': 10,
-                'lambda_L2': 0.0001}
+                'lambda_L2': 0.0}
 
     model = KlayerNN()
-    model.compile(d, K, m=50)
+    model.compile(d, K, layers=[70, 50, 20, 20, 15, 10])
 
     history = model.fit((X_train, Y_train, y_train), GDparams, val_split=0.1)
 
