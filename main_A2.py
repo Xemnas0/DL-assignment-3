@@ -8,13 +8,20 @@ from scipy import signal
 
 sns.set()
 
+
 def relu(x):
     s = np.maximum(0, x)
     return s
 
+
 def softmax(x):
     a = np.exp(x)
     return a / np.sum(a, axis=0)
+
+
+def batch_norm(S, mean, var):
+    S_hat = np.dot((np.linalg.inv(np.sqrt(np.diag(var+1e-6)))), S - mean)
+    return S_hat
 
 
 class KlayerNN:
@@ -36,10 +43,10 @@ class KlayerNN:
 
         self.layers = None
         # Model parameters
-        self.W1 = None
-        self.b1 = None
-        self.W2 = None
-        self.b2 = None
+        self.W = None
+        self.b = None
+        self.gamma = None
+        self.beta = None
 
         # History of training
         self.history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
@@ -50,24 +57,31 @@ class KlayerNN:
         self.layers = layers
         self.W = []
         self.b = []
+        self.gamma = []
+        self.beta = []
 
         # Input layer
+        m = layers[0]
         self.W.append(
-            np.random.normal(loc=0.0, scale=1 / np.sqrt(d), size=(layers[0], d))
+            np.random.normal(loc=0.0, scale=1 / np.sqrt(d), size=(m, d))
         )
-        self.b.append(np.zeros((layers[0], 1)))
+        self.b.append(np.zeros((m, 1)))
+        self.gamma.append(1)
+        self.beta.append(0)
         # k-2 hidden layers
         for i, m in enumerate(layers[1:-1]):
             self.W.append(
                 np.random.normal(loc=0.0, scale=1 / np.sqrt(layers[i]), size=(m, layers[i]))
             )
             self.b.append(np.zeros((m, 1)))
+            self.gamma.append(1)
+            self.beta.append(0)
 
         # Output layer
         self.W.append(
             np.random.normal(loc=0.0, scale=1 / np.sqrt(layers[-2]), size=(K, layers[-2]))
         )
-        self.b.append(np.zeros((K,1)))
+        self.b.append(np.zeros((K, 1)))
 
     def _saveGDparams(self, GDparams):
         self.lambda_L2 = GDparams['lambda_L2']
@@ -89,10 +103,14 @@ class KlayerNN:
 
     def forward_pass(self, X):
         S = X
-        for W, b in zip(self.W, self.b):
+        for W, b, gamma, beta in zip(self.W[:-1], self.b[:-1], self.gamma, self.beta):
             S = W.dot(S) + b
+            mean, var = S.mean(axis=1, keepdims=True), S.var(axis=1)
+            S = batch_norm(S, mean, var)
+            S = gamma * S + beta
             S = relu(S)
 
+        S = self.W[-1].dot(S) + self.b[-1]
         P = softmax(S)
         return S, P
 
@@ -281,7 +299,6 @@ def plot_history(history, GDparams):
 
 
 if __name__ == '__main__':
-
     # Loading dataset
     (X_train, y_train, Y_train), (X_test, y_test, Y_test) = load_dataset()
     # Data characteristics
@@ -289,7 +306,7 @@ if __name__ == '__main__':
     K = y_train.max() + 1
 
     # Gradient Descent parameters
-    GDparams = {'batch_size': 100,
+    GDparams = {'batch_size': 128,
                 'eta_min': 1e-5,
                 'eta_max': 1e-1,
                 'n_s': 800,
