@@ -1,26 +1,28 @@
 from matplotlib import gridspec
-import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import trange
 from scipy import signal
 
+import cupy as cp
+import numpy as np
+
 sns.set()
 
 
 def relu(x):
-    s = np.maximum(0, x)
+    s = cp.maximum(0, x)
     return s
 
 
 def softmax(x):
-    a = np.exp(x)
-    return a / np.sum(a, axis=0)
+    a = cp.exp(x)
+    return a / cp.sum(a, axis=0)
 
 
 def batch_norm(S, mean, var):
-    S_hat = np.dot((np.linalg.inv(np.sqrt(np.diag(var+1e-6)))), S - mean)
+    S_hat = cp.dot((cp.linalg.inv(cp.sqrt(cp.diag(var + 1e-6)))), S - mean)
     return S_hat
 
 
@@ -48,12 +50,15 @@ class KlayerNN:
         self.gamma = None
         self.beta = None
 
+        # Temporary values
+        self.S_all = None
+
         # History of training
         self.history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
 
     def compile(self, d, K, layers):
         self.d = d
-        self.K = K
+        self.K = K.item()
         self.layers = layers
         self.W = []
         self.b = []
@@ -63,25 +68,25 @@ class KlayerNN:
         # Input layer
         m = layers[0]
         self.W.append(
-            np.random.normal(loc=0.0, scale=1 / np.sqrt(d), size=(m, d))
+            cp.random.normal(loc=0.0, scale=1 / cp.sqrt(d), size=(m, d))
         )
-        self.b.append(np.zeros((m, 1)))
+        self.b.append(cp.zeros((m, 1)))
         self.gamma.append(1)
         self.beta.append(0)
         # k-2 hidden layers
         for i, m in enumerate(layers[1:-1]):
             self.W.append(
-                np.random.normal(loc=0.0, scale=1 / np.sqrt(layers[i]), size=(m, layers[i]))
+                cp.random.normal(loc=0.0, scale=1 / cp.sqrt(layers[i]), size=(m, layers[i]))
             )
-            self.b.append(np.zeros((m, 1)))
+            self.b.append(cp.zeros((m, 1)))
             self.gamma.append(1)
             self.beta.append(0)
 
         # Output layer
         self.W.append(
-            np.random.normal(loc=0.0, scale=1 / np.sqrt(layers[-2]), size=(K, layers[-2]))
+            cp.random.normal(loc=0.0, scale=1 / cp.sqrt(layers[-2]), size=(self.K, layers[-2]))
         )
-        self.b.append(np.zeros((K, 1)))
+        self.b.append(cp.zeros((self.K, 1)))
 
     def _saveGDparams(self, GDparams):
         self.lambda_L2 = GDparams['lambda_L2']
@@ -102,6 +107,40 @@ class KlayerNN:
         # plt.show()
 
     def forward_pass(self, X):
+        """
+        Run a forward pass storing the S(l) inside the Python class.
+
+        Parameters:
+            X: Input data
+
+        Returns:
+            Softmax probabilities.
+        """
+        self.S_all = [X]
+        for k, (W, b, gamma, beta) in enumerate(zip(self.W[:-1], self.b[:-1], self.gamma, self.beta)):
+            S = self.S_all[k]
+            S = W.dot(S) + b
+            mean, var = S.mean(axis=1, keepdims=True), S.var(axis=1)
+            S = batch_norm(S, mean, var)
+            S = gamma * S + beta
+            S = relu(S)
+            self.S_all.append(S)
+
+        S = self.W[-1].dot(self.S_all[-1]) + self.b[-1]
+        self.S_all.append(S)
+        P = softmax(S)
+        return P
+
+    def fast_forward_pass(self, X):
+        """
+        Runs a faster forward pass without storing all the S(l).
+        This should be used for evaluations at the end of each epoch.
+
+        Parameters:
+            X: Input data.
+        Returns:
+            A tuple with (last layer logits, softmax probabilities).
+        """
         S = X
         for W, b, gamma, beta in zip(self.W[:-1], self.b[:-1], self.gamma, self.beta):
             S = W.dot(S) + b
@@ -114,19 +153,22 @@ class KlayerNN:
         P = softmax(S)
         return S, P
 
-    def compute_cost(self, X, y, P=None):
+    def compute_cost(self, X, y, P=None, fast=False):
         N = X.shape[1]
         if P is None:
-            P = self.forward_pass(X)[1]
+            if fast:
+                P = self.fast_forward_pass(X)[1]
+            else:
+                P = self.forward_pass(X)
 
-        loss = -np.log(P[y, np.arange(N)]).mean()
-        reg_term = self.lambda_L2 * np.sum([np.square(W).sum() for W in self.W])
+        loss = -cp.log(P[y, cp.arange(N)]).mean()
+        reg_term = self.lambda_L2 * cp.sum([cp.square(W).sum() for W in self.W])
 
         return loss + reg_term
 
     def compute_accuracy(self, X, y):
         P = self.forward_pass(X)[1]
-        predictions = np.argmax(P, axis=0)
+        predictions = cp.argmax(P, axis=0)
         accuracy = (predictions == y).mean()
         return accuracy
 
@@ -139,7 +181,7 @@ class KlayerNN:
         return cost, accuracy
 
     def backward_pass(self, X, Y, H, P):
-        ones_nb = np.ones(self.batch_size)
+        ones_nb = cp.ones(self.batch_size)
         c = 1 / self.batch_size
         G = P - Y
         dL_dW2 = c * G.dot(H.T)
@@ -254,18 +296,18 @@ class KlayerNN:
 
 def load_dataset():
     (X_train, y_train), (X_test, y_test) = tf.keras.datasets.cifar10.load_data()
-    X_train = X_train.reshape(X_train.shape[0], -1).T
-    X_test = X_test.reshape(X_test.shape[0], -1).T
-    y_train = y_train.reshape(-1)
-    y_test = y_test.reshape(-1)
+    X_train = cp.asarray(X_train).reshape(X_train.shape[0], -1).T
+    X_test = cp.asarray(X_test).reshape(X_test.shape[0], -1).T
+    y_train = cp.asarray(y_train).reshape(-1)
+    y_test = cp.asarray(y_test).reshape(-1)
     Y_train = make_one_hot(y_train).T
     Y_test = make_one_hot(y_test).T
     return (X_train, y_train, Y_train), (X_test, y_test, Y_test)
 
 
 def make_one_hot(x):
-    one_hot_x = np.zeros((x.size, x.max() + 1))
-    one_hot_x[np.arange(x.size), x] = 1
+    one_hot_x = cp.zeros((x.size, x.max().item() + 1))
+    one_hot_x[cp.arange(x.size), x] = 1
     return one_hot_x
 
 
