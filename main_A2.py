@@ -10,6 +10,8 @@ import numpy as np
 
 sns.set()
 
+EPS = 1e-16
+
 
 def relu(x):
     s = cp.maximum(0, x)
@@ -22,7 +24,7 @@ def softmax(x):
 
 
 def batch_norm(S, mean, var):
-    S_hat = cp.dot((cp.linalg.inv(cp.sqrt(cp.diag(var + 1e-6)))), S - mean)
+    S_hat = cp.dot((cp.linalg.inv(cp.sqrt(cp.diag(var + EPS)))), S - mean)
     return S_hat
 
 
@@ -51,7 +53,11 @@ class KlayerNN:
         self.beta = None
 
         # Temporary values
-        self.S_all = None
+        self.all_X = None
+        self.all_S_hat = None
+        self.all_S = None
+        self.all_mean = None
+        self.all_var = None
 
         # History of training
         self.history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
@@ -74,7 +80,7 @@ class KlayerNN:
         self.gamma.append(1)
         self.beta.append(0)
         # k-2 hidden layers
-        for i, m in enumerate(layers[1:-1]):
+        for i, m in enumerate(layers[1:]):
             self.W.append(
                 cp.random.normal(loc=0.0, scale=1 / cp.sqrt(layers[i]), size=(m, layers[i]))
             )
@@ -84,7 +90,7 @@ class KlayerNN:
 
         # Output layer
         self.W.append(
-            cp.random.normal(loc=0.0, scale=1 / cp.sqrt(layers[-2]), size=(self.K, layers[-2]))
+            cp.random.normal(loc=0.0, scale=1 / cp.sqrt(layers[-1]), size=(self.K, layers[-1]))
         )
         self.b.append(cp.zeros((self.K, 1)))
 
@@ -102,6 +108,10 @@ class KlayerNN:
         self.scheduled_eta = (signal.sawtooth(2 * np.pi * t * freq, 0.5) + 1) / 2 * (
                 self.eta_max - self.eta_min) + self.eta_min
 
+        # Pre compute or allocate for saving computations
+        self.ones_nb = cp.ones((self.batch_size, 1))
+        self.c = 1 / self.batch_size
+
         # Debug
         # plt.plot(self.scheduled_eta)
         # plt.show()
@@ -116,18 +126,26 @@ class KlayerNN:
         Returns:
             Softmax probabilities.
         """
-        self.S_all = [X]
+        self.all_X = [X]
+        self.all_S_hat = []
+        self.all_S = []
+        self.all_mean = []
+        self.all_var = []
         for k, (W, b, gamma, beta) in enumerate(zip(self.W[:-1], self.b[:-1], self.gamma, self.beta)):
-            S = self.S_all[k]
+            S = self.all_X[k]
             S = W.dot(S) + b
+            self.all_S.append(S)
             mean, var = S.mean(axis=1, keepdims=True), S.var(axis=1)
+            self.all_mean.append(mean)
+            self.all_var.append(var)
             S = batch_norm(S, mean, var)
+            self.all_S_hat.append(S)
             S = gamma * S + beta
             S = relu(S)
-            self.S_all.append(S)
+            self.all_X.append(S)
 
-        S = self.W[-1].dot(self.S_all[-1]) + self.b[-1]
-        self.S_all.append(S)
+        S = self.W[-1].dot(self.all_X[-1]) + self.b[-1]
+        self.all_S.append(S)
         P = softmax(S)
         return P
 
@@ -162,36 +180,83 @@ class KlayerNN:
                 P = self.forward_pass(X)
 
         loss = -cp.log(P[y, cp.arange(N)]).mean()
-        reg_term = self.lambda_L2 * cp.sum([cp.square(W).sum() for W in self.W])
+        reg_term = self.lambda_L2 * np.sum([cp.square(W).sum() for W in self.W])
 
-        return loss + reg_term
+        return (loss + reg_term).item(), P
 
-    def compute_accuracy(self, X, y):
-        P = self.forward_pass(X)[1]
+    def compute_accuracy(self, X, y, P=None, fast=False):
+        if P is None:
+            if fast:
+                P = self.fast_forward_pass(X)[1]
+            else:
+                P = self.forward_pass(X)
         predictions = cp.argmax(P, axis=0)
-        accuracy = (predictions == y).mean()
-        return accuracy
+        accuracy = cp.mean(predictions == y)
+        return accuracy.item()
 
-    def evaluate(self, X, y):
+    def evaluate(self, X, y, fast=True):
         """
         Computes cost and accuracy of the given data.
         """
-        cost = self.compute_cost(X, y)
-        accuracy = self.compute_accuracy(X, y)
+        cost, P = self.compute_cost(X, y, fast=fast)
+        accuracy = self.compute_accuracy(X, y, P, fast=fast)
         return cost, accuracy
 
-    def backward_pass(self, X, Y, H, P):
-        ones_nb = cp.ones(self.batch_size)
-        c = 1 / self.batch_size
-        G = P - Y
-        dL_dW2 = c * G.dot(H.T)
-        dL_db2 = c * G.dot(ones_nb).reshape(self.K, 1)
-        G = self.W2.T.dot(G)
-        G = G * (H > 0)
-        dL_dW1 = c * G.dot(X.T)
-        dL_db1 = c * G.dot(ones_nb).reshape(self.m, 1)
+    def backward_pass(self, X, Y, P):
+        c = self.c
+        k = len(self.layers) + 1  # hidden + output
+        ones_nb = self.ones_nb
+        X_all = self.all_X
 
-        return dL_dW1, dL_db1, dL_dW2, dL_db2
+        # (21)
+        G = P - Y
+        # (22)
+        dJ_dW_k = c * G.dot(X_all[k - 1].T) + 2 * self.lambda_L2 * self.W[k - 1]
+        dJ_db_k = c * G.dot(ones_nb)
+        # (23)
+        G = self.W[k - 1].T.dot(G)
+        # (24)
+        G = G * (X_all[k - 1] > 0)
+
+        dJ_dgamma_l = []
+        dJ_dbeta_l = []
+        dJ_dW_l = []
+        dJ_db_l = []
+        for l in range(k - 2, -1, -1):
+            # (25)
+            dJ_dgamma_l.append(c * (G * self.all_S_hat[l]).dot(ones_nb))
+            dJ_dbeta_l.append(c * G.dot(ones_nb))
+            # (26)
+            G = G * self.gamma[l] * ones_nb.T
+            # (27)
+            G = self.BN_backpass(G, self.all_S_hat[l], self.all_mean[l], self.all_var[l])
+            # (28)
+            dJ_dW_l.append(c * G.dot(self.all_X[l].T) + 2 * self.lambda_L2 * self.W[l])
+            dJ_db_l.append(c * G.dot(ones_nb))
+
+            if l >= 1:
+                # (29)
+                G = self.W[l].T.dot(G)
+                # (30)
+                G = G * (self.all_X[l] > 0)
+
+        dJ_dW = list(reversed(dJ_dW_l)) + [dJ_dW_k]
+        dJ_db = list(reversed(dJ_db_l)) + [dJ_db_k]
+        dJ_dgamma = list(reversed(dJ_dgamma_l))
+        dJ_dbeta = list(reversed(dJ_dbeta_l))
+
+        return dJ_dW, dJ_db, dJ_dgamma, dJ_dbeta
+
+    def BN_backpass(self, G, S, mu, v):
+        oneT = self.ones_nb.T
+        sigma1 = ((v + EPS) ** -0.5).reshape(-1, 1)
+        sigma2 = ((v + EPS) ** -1.5).reshape(-1, 1)
+        G1 = G * (sigma1.dot(oneT))
+        G2 = G * (sigma2.dot(oneT))
+        D = S - mu.dot(oneT)
+        c = (G2 * D).dot(oneT.T)
+        G = G1 - self.c * (G1.dot(oneT.T)).dot(oneT) - self.c * D * (c.dot(oneT))  # TODO: can be optimized
+        return G
 
     def fit(self, train_data, GDparams, val_data=None, val_split=None):
         assert val_data is not None or val_split is not None, 'Validation set not defined.'
@@ -214,13 +279,14 @@ class KlayerNN:
             if shuffle:
                 self.shuffleData(train_data)
 
+            self._run_batches(train_data, n_batches, epoch)
+
             # Evaluate for saving in history
             train_loss, train_acc, val_loss, val_acc = self._update_history(train_data, val_data)
 
             for_epoch.set_description(f'train_loss: {train_loss:.4f}\ttrain_acc: {100 * train_acc:.2f}%' + ' | ' +
                                       f'val_loss: {val_loss:.4f}\ttrain_acc: {100 * val_acc:.2f}% ')
 
-            self._run_batches(train_data, n_batches, epoch)
 
     def _run_batches(self, train_data, n_batches, epoch):
 
@@ -232,13 +298,17 @@ class KlayerNN:
             self._update_weights(X_batch, Y_batch)
 
     def _update_weights(self, X_batch, Y_batch):
-        H, P = self.forward_pass(X_batch)
-        dL_dW1, dL_db1, dL_dW2, dL_db2 = self.backward_pass(X_batch, Y_batch, H, P)
+        P = self.forward_pass(X_batch)
+        dJ_dW, dJ_db, dJ_dgamma, dJ_dbeta = self.backward_pass(X_batch, Y_batch, P)
 
-        self.W1 -= self.eta * dL_dW1 + 2 * self.lambda_L2 * self.W1
-        self.b1 -= self.eta * dL_db1
-        self.W2 -= self.eta * dL_dW2 + 2 * self.lambda_L2 * self.W2
-        self.b2 -= self.eta * dL_db2
+        self.W[0] -= self.eta * dJ_dW[0] + 2 * self.lambda_L2 * self.W[0]
+        self.b[0] -= self.eta * dJ_db[0]
+
+        for i, (dW, db, dgamma, dbeta) in enumerate(zip(dJ_dW[1:], dJ_db[1:], dJ_dgamma, dJ_dbeta)):
+            self.W[i + 1] -= self.eta * dW + 2 * self.lambda_L2 * self.W[i + 1]
+            self.b[i + 1] -= self.eta * db
+            self.gamma[i] -= self.eta * dgamma
+            self.beta[i] -= self.eta * dbeta
 
     def _get_mini_batch(self, data, j):
         j_start = j * self.batch_size
@@ -259,8 +329,8 @@ class KlayerNN:
         data[2][:] = data[2][indeces]
 
     def _update_history(self, train_data, val_data):
-        train_loss, train_acc = self.evaluate(train_data[0], train_data[2])
-        val_loss, val_acc = self.evaluate(val_data[0], val_data[2])
+        train_loss, train_acc = self.evaluate(train_data[0], train_data[2], fast=True)
+        val_loss, val_acc = self.evaluate(val_data[0], val_data[2], fast=True)
 
         self.history['train_loss'].append(train_loss)
         self.history['train_acc'].append(train_acc)
@@ -352,11 +422,11 @@ if __name__ == '__main__':
                 'eta_min': 1e-5,
                 'eta_max': 1e-1,
                 'n_s': 800,
-                'n_epochs': 10,
+                'n_epochs': 100,
                 'lambda_L2': 0.0}
 
     model = KlayerNN()
-    model.compile(d, K, layers=[70, 50, 20, 20, 15, 10])
+    model.compile(d, K, layers=[50, 30])
 
     history = model.fit((X_train, Y_train, y_train), GDparams, val_split=0.1)
 
