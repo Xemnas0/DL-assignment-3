@@ -13,8 +13,8 @@ sns.set()
 EPS = 1e-16
 
 
-# cp.random.seed(0)
-# np.random.seed(0)
+cp.random.seed(100)
+np.random.seed(100)
 
 
 def relu(x):
@@ -49,6 +49,7 @@ class KlayerNN:
         self.eta_max = None
         self.eta = None
         self.alpha_exp_avg = None
+        self.sigma_init = None
 
         self.layers = None
 
@@ -95,24 +96,27 @@ class KlayerNN:
         K = self.K
         # Input layer
         m = layers[0]
+        std = cp.sqrt(2 / d) if self.sigma_init is None else self.sigma_init
         self.W.append(
-            cp.random.normal(loc=0.0, scale=cp.sqrt(2 / d), size=(m, d))
+            cp.random.normal(loc=0.0, scale=std, size=(m, d))
         )
         self.b.append(cp.zeros((m, 1)))
         self.gamma.append(cp.ones((m, 1)))
         self.beta.append(cp.zeros((m, 1)))
         # k-2 hidden layers
         for i, m in enumerate(layers[1:]):
+            std = cp.sqrt(2 / layers[i]) if self.sigma_init is None else self.sigma_init
             self.W.append(
-                cp.random.normal(loc=0.0, scale=cp.sqrt(2 / layers[i]), size=(m, layers[i]))
+                cp.random.normal(loc=0.0, scale=std, size=(m, layers[i]))
             )
             self.b.append(cp.zeros((m, 1)))
             self.gamma.append(cp.ones((m, 1)))
             self.beta.append(cp.zeros((m, 1)))
 
         # Output layer
+        std = cp.sqrt(2 / layers[-1]) if self.sigma_init is None else self.sigma_init
         self.W.append(
-            cp.random.normal(loc=0.0, scale=cp.sqrt(2 / layers[-1]), size=(K, layers[-1]))
+            cp.random.normal(loc=0.0, scale=std, size=(K, layers[-1]))
         )
         self.b.append(cp.zeros((K, 1)))
 
@@ -128,6 +132,7 @@ class KlayerNN:
         self.alpha_exp_avg = GDparams['alpha_exp_avg']
         self.n_cycles = GDparams['n_cycles']
         self.BN = GDparams['BN']
+        self.sigma_init = GDparams['sigma_init']
 
         # Prepare schedule of the learning rate
         t = np.arange(self.n_s * 2)
@@ -352,7 +357,7 @@ class KlayerNN:
         dJ_dW, dJ_db, dJ_dgamma, dJ_dbeta = self.backward_pass(X_batch, Y_batch, P)
 
         if self.check_gradient:
-            self._check_gradient_numerically(X_batch, Y_batch, y_batch, d=10, N=2, M=20)
+            self._check_gradient_numerically(X_batch, Y_batch, y_batch, N=10, d=10)
 
         if self.BN:
             self.W[0] -= self.eta * dJ_dW[0]
@@ -458,89 +463,102 @@ class KlayerNN:
 
         return dL_dW1, dL_db1, dL_dW2, dL_db2
 
-    def _compute_grad_num_slow(self, X, y, W1, W2, h=1e-5):
+    def _compute_grad_num_slow(self, X, y, h=1e-5):
 
-        dL_dW1 = np.zeros(W1.shape)
-        dL_db1 = np.zeros(self.b1.shape)
-        dL_dW2 = np.zeros(W2.shape)
-        dL_db2 = np.zeros(self.b2.shape)
-
-        for i in range(len(self.b1)):
-            self.b1[i] -= h
-            c1 = self.compute_cost_num(X, y, W1, W2)[0]
-            self.b1[i] += 2 * h
-            c2 = self.compute_cost_num(X, y, W1, W2)[0]
-            self.b1[i] -= h
-            dL_db1[i] = (c2 - c1) / (2 * h)
-
-        for i in range(len(self.b2)):
-            self.b2[i] -= h
-            c1 = self.compute_cost_num(X, y, W1, W2)[0]
-            self.b2[i] += 2 * h
-            c2 = self.compute_cost_num(X, y, W1, W2)[0]
-            self.b2[i] -= h
-            dL_db2[i] = (c2 - c1) / (2 * h)
-
-        for i in range(W1.shape[0]):
-            for j in range(W1.shape[1]):
-                W1[i, j] -= h
-                c1 = self.compute_cost_num(X, y, W1, W2)[0]
-                W1[i, j] += 2 * h
-                c2 = self.compute_cost_num(X, y, W1, W2)[0]
-                W1[i, j] -= h
-                dL_dW1[i, j] = (c2 - c1) / (2 * h)
-
-        for i in range(W2.shape[0]):
-            for j in range(W2.shape[1]):
-                W2[i, j] -= h
-                c1 = self.compute_cost_num(X, y, W1, W2)[0]
-                W2[i, j] += 2 * h
-                c2 = self.compute_cost_num(X, y, W1, W2)[0]
-                W2[i, j] -= h
-                dL_dW2[i, j] = (c2 - c1) / (2 * h)
-
-        return dL_dW1, dL_db1, dL_dW2, dL_db2
-
-    def _check_gradient_numerically(self, X_batch, Y_batch, y_batch, d, N):
-        """
-        Parameters:
-            N: Number of samples to test
-            M: Number of features to test
-        """
-        h = 1e-5
         grad_all_b = []
         for j in range(len(self.b)):
             grad_b = cp.zeros(self.b[j].shape)
             for i in range(len(self.b[j])):
-                self.b[i][j] -= h
-                c1 = self.compute_cost(X_batch, y_batch, fast=True)[0]
-                self.b[i][j] += 2 * h
-                c2 = self.compute_cost(X_batch, y_batch, fast=True)[0]
-                grad_b = (c2 - c1) / (2 * h)
-                grad_all_b.append(grad_b)
+                self.b[j][i] -= h
+                c1 = self.compute_cost(X, y, fast=True)[0]
+                self.b[j][i] += 2 * h
+                c2 = self.compute_cost(X, y, fast=True)[0]
+                self.b[j][i] -= h
+                grad_b[i] = (c2 - c1) / (2 * h)
+            grad_all_b.append(grad_b)
 
         grad_all_W = []
         for j in range(len(self.W)):
             grad_W = cp.zeros(self.W[j].shape)
             for i in range(len(self.W[j])):
-                self.W[j][i]
-        # H, P = self.forward_pass_num(X_batch[:M, :N], W1=self.W1[:, :M], W2=self.W2)
-        # dL_dW1_check, dL_db1_check, dL_dW2_check, dL_db2_check = self.backward_pass_num(X_batch[:M, :N],
-        #                                                                                 Y_batch[:, :N],
-        #                                                                                 self.W1[:, :M], self.W2, H,
-        #                                                                                 P)
-        # dL_dW1_n, dL_db1_n, dL_dW2_n, dL_db2_n = self._compute_grad_num_slow(X_batch[:M, :N], y_batch[:N],
-        #                                                                      self.W1[:, :M], self.W2)
-        #
-        # ok_W1 = self._compute_numerical_error(dL_dW1_n, dL_dW1_check)
-        # ok_b1 = self._compute_numerical_error(dL_db1_n, dL_db1_check)
-        # ok_W2 = self._compute_numerical_error(dL_dW2_n, dL_dW2_check)
-        # ok_b2 = self._compute_numerical_error(dL_db2_n, dL_db2_check)
-        # print(f'Sanity check: {ok_W1}, {ok_b1}, {ok_W2}, {ok_b2}')
+                self.W[j][i] -= h
+                c1 = self.compute_cost(X, y, fast=True)[0]
+                self.W[j][j] += 2 * h
+                c2 = self.compute_cost(X, y, fast=True)[0]
+                self.W[j][i] -= h
+                grad_W[i] = (c2 - c1) / (2 * h)
+            grad_all_W.append(grad_W)
+
+        if self.BN:
+            grad_all_gamma = []
+            for j in range(len(self.gamma)):
+                grad_gamma = cp.zeros(self.gamma[j].shape)
+                for i in range(len(self.gamma[j])):
+                    self.gamma[j][i] -= h
+                    c1 = self.compute_cost(X, y, fast=True)[0]
+                    self.gamma[j][i] += 2 * h
+                    c2 = self.compute_cost(X, y, fast=True)[0]
+                    self.gamma[j][i] -= h
+                    grad_gamma[i] = (c2 - c1) / (2 * h)
+                grad_all_gamma.append(grad_gamma)
+
+            grad_all_beta = []
+            for j in range(len(self.beta)):
+                grad_beta = cp.zeros(self.beta[j].shape)
+                for i in range(len(self.beta[j])):
+                    self.beta[j][i] -= h
+                    c1 = self.compute_cost(X, y, fast=True)[0]
+                    self.beta[j][i] += 2 * h
+                    c2 = self.compute_cost(X, y, fast=True)[0]
+                    self.beta[j][i] -= h
+                    grad_beta[i] = (c2 - c1) / (2 * h)
+                grad_all_beta.append(grad_beta)
+
+            return grad_all_W, grad_all_b, grad_all_gamma, grad_all_beta
+        return grad_all_W, grad_all_b
+
+    def _check_gradient_numerically(self, X_batch, Y_batch, y_batch, N, d):
+        """
+        Parameters:
+            N: Number of samples to test
+            d: Number of features to test
+        """
+
+        X = X_batch[:d, :N]
+        Y = Y_batch[:, :N]
+        y = y_batch[:N]
+        backup_W = cp.copy(self.W[0])
+        self.W[0] = self.W[0][:, :d]
+        self.c = 1 / N
+        self.ones_nb = cp.ones((N, 1))
+
+        if self.BN:
+            grad_all_W, grad_all_b, grad_all_gamma, grad_all_beta = self._compute_grad_num_slow(X, y)
+
+            P = self.forward_pass(X)
+            dJ_dW, dJ_db, dJ_dgamma, dJ_dbeta = self.backward_pass(X, Y, P)
+
+            ok = self._compute_numerical_error(grad_all_W[0], dJ_dW[0])
+            ok = self._compute_numerical_error(grad_all_b[0], dJ_db[0])
+            for i, (dW_num, dW, db_num, db, dgamma_num, dgamma, dbeta_num, dbeta) in enumerate(
+                zip(grad_all_W[1:], dJ_dW[1:], grad_all_b[1:], dJ_db[1:], grad_all_gamma, dJ_dgamma, grad_all_beta, dJ_dbeta)):
+                ok = self._compute_numerical_error(dW_num[i+1], dW[i+1])
+                ok = self._compute_numerical_error(db_num[i+1], db[i+1])
+                ok = self._compute_numerical_error(dgamma_num[i], dgamma[i])
+                ok = self._compute_numerical_error(dbeta_num[i], dbeta[i])
+        else:
+            grad_all_W, grad_all_b = self._compute_grad_num_slow(X, y)
+
+            P = self.forward_pass(X)
+            dJ_dW, dJ_db, _, _ = self.backward_pass(X, Y, P)
+            for i, (dW_num, dW, db_num, db) in enumerate(
+                zip(grad_all_W[1:], dJ_dW[1:], grad_all_b[1:], dJ_db[1:])):
+                ok = self._compute_numerical_error(dW_num[i], dW[i])
+                ok = self._compute_numerical_error(db_num[i], db[i])
 
     def _compute_numerical_error(self, A_num, A_check):
-        eps = 1e-8
-        tolerance_error = 1e-5
+        eps = 1e-16
+        tolerance_error = 1e-8
         num = np.abs(A_check - A_num)
         den = np.maximum(eps, np.abs(A_num) + np.abs(A_check))
         err = num / den
@@ -604,7 +622,7 @@ def plot_history(history, GDparams, layers):
 
     fig.show()
 
-    fig.savefig('second_experiment.png'.format(GDparams['lambda_L2']))
+    fig.savefig('experiment.pdf'.format(GDparams['lambda_L2']))
 
     # plt.plot(history['eta'])
     # plt.show()
@@ -621,9 +639,9 @@ if __name__ == '__main__':
     test_cost = []
     test_acc = []
     all_lambda = []
-    # for val_lambda in np.arange(0, 0.02, 0.002):
+    # for val_lambda in np.arange(0.004, 0.006, 0.0001):
     # Gradient Descent parameters
-    # for lambda_L2 in np.arange(0.001, 0.1,)
+    # for lambda_L2 in np.arange(0.001, 0.1,):
     batch_size = 100
     GDparams = {'BN': False,
                 'batch_size': batch_size,
@@ -631,8 +649,9 @@ if __name__ == '__main__':
                 'eta_max': 1e-1,
                 'n_s': 5 * 45000 // batch_size,
                 'n_cycles': 2,
-                'lambda_L2': 0.006,  # val_lambda,#0.005,
-                'alpha_exp_avg': 0.9}
+                'lambda_L2': 0.0052,
+                'alpha_exp_avg': 0.9,
+                'sigma_init': 1e-4}
     # layers = [50, 30, 20, 20, 10, 10, 10, 10]
     layers = [50, 50]
 
@@ -644,8 +663,8 @@ if __name__ == '__main__':
     history['test_cost'], history['test_loss'], history['test_acc'] = model.evaluate(X_test, y_test)
     print('Test cost: {0:.4f}\tTest acc: {1:.2f}%'.format(history['test_cost'], history['test_acc'] * 100))
 
-    test_cost.append(history['test_cost'])
-    test_acc.append(history['test_acc'])
+    # test_cost.append(history['test_cost'])
+    # test_acc.append(history['test_acc'])
     # print(val_lambda)
     # all_lambda.append(val_lambda)
     # best_i = np.argmax(test_acc)
